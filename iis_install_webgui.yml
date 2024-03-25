@@ -1,0 +1,382 @@
+---
+- hosts: windows
+  gather_facts: false
+  vars:
+    computer_name: "{{ ansible_hostname }}"
+    inet_pub_move_to_drive: "{% if computer_name.startswith('AC') or computer_name.startswith('AS') %}F{% else %}D{% endif %}"
+    inet_pub_root: "{{ inet_pub_move_to_drive }}:\\Inetpub"
+    inet_pub_logs: "{{ inet_pub_root }}\\logs\\logfiles"
+    inet_pub_old_location: "C:\\inetpub"
+    install_files: "{{ playbook_dir }}"
+    rule1: "Remove_SRV_ResponseHeader"
+    log_file_name: "{{ install_files }}\\Install_IIS.log"
+
+  tasks:
+    - name: Initialize and format disk
+      win_shell: |
+        $DiskValidation = $true
+        try {
+          Initialize-Disk -Number 1 -PartitionStyle MBR -PassThru -ErrorAction Stop | New-Partition -DriveLetter "{{ inet_pub_move_to_drive }}" -UseMaximumSize -ErrorAction Stop | Format-Volume -FileSystem NTFS -NewFileSystemLabel "Data" -Confirm:$false -ErrorAction Stop | Out-Null
+          "Disk initialization, partition, and format successfully completed" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          try {
+            Get-Disk -Number 1 -ErrorAction Stop | ? {$_.PartitionStyle -eq "MBR"} | New-Partition -DriveLetter "{{ inet_pub_move_to_drive }}" -UseMaximumSize -ErrorAction Stop | Format-Volume -FileSystem NTFS -NewFileSystemLabel "Data" -Confirm:$false -ErrorAction Stop | Out-Null
+            "Disk already initialized, partition, and format successfully completed" | Out-File "{{ log_file_name }}" -Append -Force
+          } catch {
+            $DiskValidation = $false
+            "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+          }
+        }
+        $DiskValidation
+      register: disk_validation_result
+
+    - name: Create log directory if it does not exist
+      win_file:
+        path: "{{ inet_pub_move_to_drive }}:\\Install_IIS\\Logs"
+        state: directory
+      when: disk_validation_result.stdout | bool
+
+    - name: Import ServerManager module
+      win_shell: |
+        try {
+          Import-Module ServerManager | Out-Null
+          "Importing Module ServerManager" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      register: import_result
+      failed_when: "'ERROR' in import_result.stderr"
+
+    - name: Install IIS
+      win_feature:
+        name: 
+          - Web-webserver
+          - Web-mgmt-console
+          - Web-Default-Doc
+          - Web-Dir-Browsing
+          - Web-Http-Errors
+          - Web-Static-Content
+          - Web-Http-Redirect
+          - Web-Http-Logging
+          - Web-Log-Libraries
+          - Web-Request-Monitor
+          - Web-HTTP-Tracing
+          - Web-Stat-Compression
+          - Web-Filtering
+          - Web-IP-Security
+          - Web-Windows-Auth
+          - Web-Net-Ext45
+          - Web-AppInit
+          - Web-ASP
+          - Web-Asp-Net45
+          - Web-ISAPI-Ext
+          - Web-ISAPI-Filter
+          -```yaml
+          - Web-Dyn-Compression
+          - Web-Scripting-Tools
+          - Web-Mgmt-Service
+          - NET-Framework-45-ASPNET
+        state: present
+      register: iis_install_result
+      failed_when: "iis_install_result.failed"
+
+    - name: Log IIS installation
+      win_shell: |
+        if (${{ iis_install_result.failed }}) {
+          "ERROR: IIS installation failed" | Out-File "{{ log_file_name }}" -Append -Force
+        } else {
+          "Installing IIS" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+    
+    - name: Import WebAdministration module
+      win_shell: |
+        try {
+          Import-Module WebAdministration | Out-Null
+          "Importing Module WebAdministration" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      register: import_webadministration_result
+      failed_when: "'ERROR' in import_webadministration_result.stderr"
+    
+    - name: Move WWW Root data to new folder
+      win_shell: |
+        try {
+          xcopy "{{ inet_pub_old_location }}" "{{ inet_pub_root }}" /E /O /I /Y /Q  | Out-Null
+          New-Item -Path "{{ inet_pub_root }}\logs\logfiles" -type directory -Force -ErrorAction SilentlyContinue | Out-Null
+          New-Item -Path "{{ inet_pub_root }}\logs\logfiles\FailedReqLogFiles" -type directory -Force -ErrorAction SilentlyContinue | Out-Null
+          reg.exe add "HKLM\System\CurrentControlSet\Services\WAS\Parameters" /v ConfigIsolationPath /t REG_SZ /d "{{ inet_pub_root }}\temp\appPools" /f | Out-Null
+          "Moving WWW Root data to new folder" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      register: move_www_root_data_result
+      failed_when: "'ERROR' in move_www_root_data_result.stderr"
+    
+    - name: Add and Remove HTTP Response Headers
+      win_shell: |
+        try {
+          $HeadersToAdd = @{
+              "X-Frame-Options" = "SAMEORIGIN"
+              "X-XSS-Protection" = "1;mode=block"
+              "X-Content-Type-Options" = "nosniff"
+              "Strict-Transport-Security" = "max-age=31536000; includeSubDomains; preload"
+          }
+          $HeadersToAdd.GetEnumerator() | % {
+              $HeaderName = $_.Name
+              $HeaderValue = $_.Value
+              if(!(Get-WebConfiguration "/system.webServer/httpProtocol/customHeaders/add[@Name=""$($HeaderName)""]")){
+                  Add-WebConfiguration -Filter "/system.webServer/httpProtocol/customHeaders" -Value @{Name="$($HeaderName)";Value="$($HeaderValue)"}
+              }
+          }
+          $HeadersToRemove = "X-Powered-By"
+          $HeadersToRemove | % {
+              $HeaderName = $_
+              if(Get-WebConfiguration "/system.webServer/httpProtocol/customHeaders/add[@Name=""$($HeaderName)""]")){
+                  Clear-WebConfiguration -Filter "/system.webServer/httpProtocol/customHeaders/add[@Name=""$($HeaderName)""]"
+              }
+          }
+          "Adding and Removing HTTP Response Headers" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      register: setting_iis_vars_result
+      failed_when: "'ERROR' in setting_iis_vars_result.stderr"
+    
+    - name: Remove IIS Server Response Header
+      win_shell: |
+        try {
+          Set-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST'  -filter "system.webServer/security/requestFiltering" -name "removeServerHeader" -value "True"
+          "Remove IIS Server Response Header" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      register: remove_server_response_header_result
+      failed_when: "'ERROR' in remove_server_response_header_result.stderr"
+
+    - name: Remove X-aspNet-Version Globally
+      win_shell: |
+        try {
+          Set-WebConfigurationProperty -pspath 'MACHINE/WEBROOT' -filter "system.web/httpRuntime" -name "enableVersionHeader" -value "False"
+          "Remove X-aspNet-Version Globally" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      register: remove_aspnet_version_result
+      failed_when: "'ERROR' in remove_aspnet_version_result.stderr"
+
+    - name: Changing Log Location
+      win_shell: |
+        try {
+          $InetpubLogs = "{{ inetpub_logs }}"
+          Set-WebConfigurationProperty "/system.applicationHost/sites/siteDefaults"  -name logfile.directory -value "$InetpubLogs"
+          Set-WebConfigurationProperty "/system.applicationHost/sites/siteDefaults"  -name traceFailedRequestsLogging.directory -value "$InetpubLogs\logs\logfiles\FailedReqLogFiles"
+          Set-WebConfigurationProperty "/system.applicationHost/log" -name centralBinaryLogFile.directory -value "$InetpubLogs"
+          Set-WebConfigurationProperty "/system.applicationHost/log"  -name centralW3CLogFile.directory -value "$InetpubLogs"
+          Set-ItemProperty -path "HKLM:\SOFTWARE\Microsoft\WebManagement\Server" -name "LoggingDirectory" -value "$InetpubLogs\wmsvc"
+          "Changing Log Location" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      vars:
+        inetpub_logs: 'your_log_directory_path_here'  # replace with your actual directory path
+      register: change_log_location_result
+      failed_when: "'ERROR' in change_log_location_result.stderr"
+ 
+    - name: Configure request filtering
+      win_shell: |
+        try {
+          set-WebConfiguration -Filter  /system.webServer/security/requestFiltering/verbs  -value (@{verb="TRACE";allowed="false"},@{verb="OPTIONS";allowed="false"},@{verb="PUT";allowed="false"},@{verb="DELETE";allowed="false"},@{verb="GET";allowed="true"},@{verb="POST";allowed="true"})
+          "Configure request filtering" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      register: configure_request_filtering_result
+      failed_when: "'ERROR' in configure_request_filtering_result.stderr"
+
+    - name: Configure Application Pools Defaults
+      win_shell: |
+        try {
+          Set-WebConfigurationProperty '/system.applicationHost/applicationPools/applicationPoolDefaults/recycling' -Name logEventOnRecycle -value "Time, Requests, Schedule, Memory, IsapiUnhealthy, OnDemand, ConfigChange, PrivateMemory"
+          Set-WebConfigurationProperty '/system.applicationHost/applicationPools/applicationPoolDefaults/recycling/periodicRestart' -Name privateMemory -value 1500000
+          Set-WebConfigurationProperty '/system.applicationHost/sites/siteDefaults/logFile' -name logExtFileFlags -value "Date, Time, ClientIP, UserName, ComputerName, ServerIP, Method, UriStem, UriQuery, HttpStatus, Win32Status, BytesSent, BytesRecv, TimeTaken, ServerPort, UserAgent, Cookie, Referer, ProtocolVersion, HttpSubStatus"
+          "Configure Application Pools Defaults" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      register: configure_app_pools_defaults_result
+      failed_when: "'ERROR' in configure_app_pools_defaults_result.stderr"
+
+    - name: Moving history, temporary and path for default web site
+      win_shell: |
+        try {
+          Set-WebConfigurationProperty '/system.applicationHost/configHistory' -Name path -value "$InetPubRoot\history"
+          Set-WebConfigurationProperty -Filter '/system.webServer/asp/cache' -name diskTemplateCacheDirectory -value "$InetPubRoot\temp\ASP Compiled Templates"
+          "Moving history, temporary and path for default web site" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      register: move_history_temp_path_result
+      failed_when: "'ERROR' in move_history_temp_path_result.stderr"
+
+    - name: Moving Temporary Files
+      win_shell: |
+        try {
+          Set-WebConfigurationProperty '/system.webServer/httpCompression' -Name directory -value "$InetPubRoot\temp\IIS Temporary Compressed Files"
+          Set-ItemProperty -path "HKLM:\System\CurrentControlSet\Services\WAS\Parameters" -name "ConfigIsolationPath" -value "$InetPubRoot\temp\appPools"
+          "Moving Temporary Files" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      register: move_temp_files_result
+      failed_when: "'ERROR' in move_temp_files_result.stderr"
+
+    - name: Move custom Error locations
+      win_shell: |
+        try {
+          Set-WebConfigurationProperty /system.webServer/httpErrors/* -Name prefixLanguageFilePath -value "$InetPubRoot\custerr"
+          "Move custom Error locations" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      register: move_error_locations_result
+      failed_when: "'ERROR' in move_error_locations_result.stderr"
+
+    - name: Update IIS root directories in registry for service pack and hotfix installers
+      win_shell: |
+        try {
+          if (Get-ItemProperty -Path "HKLM:\Software\Microsoft\inetstp" -Name "PathWWWRoot" -ErrorAction "SilentlyContinue") {
+            Set-ItemProperty -path "HKLM:\Software\Microsoft\inetstp" -name "PathWWWRoot" -value "$InetPubRoot\wwwroot"
+          }
+          if (Get-ItemProperty -Path "HKLM:\Software\Wow6432Node\Microsoft\inetstp" -Name "PathWWWRoot" -ErrorAction "SilentlyContinue") {
+            Set-ItemProperty -Path "HKLM:\Software\Wow6432Node\Microsoft\inetstp" -name "PathWWWRoot" -value "$InetPubRoot\wwwroot"
+          }
+          "Making sure Service Pack and Hotfix Installers know where the IIS root directories are" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      register: update_iis_root_directories_result
+      failed_when: "'ERROR' in update_iis_root_directories_result.stderr"
+
+#    - name: Change the Default Website location
+#      win_shell: |
+#        Set-ItemProperty 'IIS:\Sites\Default Web Site' -name physicalPath -value "$InetPubRoot\wwwroot"
+#      register: change_default_website_location_result
+#      failed_when: "'ERROR' in change_default_website_location_result.stderr"
+
+    - name: Reset IIS
+      win_shell: |
+        try {
+          iisreset | Out-Null
+          "IIS has been reset" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      args:
+        executable: powershell
+      register: reset_iis_result
+      failed_when: "'ERROR' in reset_iis_result.stderr"
+
+    - name: Enable Web Remote Management
+      win_shell: |
+        try {
+          Set-ItemProperty -Path HKLM:\SOFTWARE\Microsoft\WebManagement\Server -Name EnableRemoteManagement -Value 1 | Out-Null
+          Set-Service -name WMSVC -StartupType Automatic | Out-Null
+          "Web remote management has been enabled" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      args:
+        executable: powershell
+      register: enable_web_remote_management_result
+      failed_when: "'ERROR' in enable_web_remote_management_result.stderr"
+
+    - name: Cleanup IIS Logs
+      win_shell: |
+        try {
+          Remove-Item "{{ inet_pub_root }}\\logs\\FailedReqLogFiles" -Recurse -Force
+          "Cleanup completed" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      args:
+        executable: powershell
+      register: cleanup_iis_logs_result
+      failed_when: "'ERROR' in cleanup_iis_logs_result.stderr"
+
+    - name: Install IIS URL Rewrite Module
+      win_shell: |
+        try {
+          $currentValue = (Get-ItemProperty "hklm:Software\Microsoft\InetStp").MajorVersion
+          if ($currentValue -eq 10) {
+            $registryPath = "HKLM:Software\Microsoft\InetStp"
+            $Name = "MajorVersion"
+            $newvalue = "7"
+            New-ItemProperty -Path $registryPath -Name $name -Value $newvalue -PropertyType DWORD -Force | Out-Null 
+            (Start-Process "{{ install_files_path }}\\rewrite_amd64.msi" -ArgumentList "/passive" -Wait -Passthru).ExitCode | Out-Null
+            New-ItemProperty -Path $registryPath -Name $name -Value $currentValue -PropertyType DWORD -Force | Out-Null
+          } else {
+            (Start-Process "{{ install_files_path }}\\rewrite_amd64.msi" -ArgumentList "/passive" -Wait -Passthru).ExitCode | Out-Null
+          }
+          "IIS URL Rewrite Module installed" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      args:
+        executable: powershell
+      register: install_iis_rewrite_module_result
+      failed_when: "'ERROR' in install_iis_rewrite_module_result.stderr"
+
+    - name: Add Server Global Setting to URLRewrite
+      win_shell: |
+        try {
+          Import-Module WebAdministration 
+          Add-WebConfigurationProperty -pspath "MACHINE/WEBROOT/APPHOST" -filter "system.webServer/rewrite/outboundrules" -name "." -value @{name="{{ rule1 }}"}
+          Set-WebConfigurationProperty -pspath "MACHINE/WEBROOT/APPHOST"  -filter "system.webServer/rewrite/outboundRules/rule[@name='{{ rule1 }}']/match" -name "serverVariable" -value "RESPONSE_SERVER"
+          Set-WebConfigurationProperty -pspath "MACHINE/WEBROOT/APPHOST"  -filter "system.webServer/rewrite/outboundRules/rule[@name='{{ rule1 }}']/match" -name "pattern" -value ".*"
+          Set-WebConfigurationProperty -pspath "MACHINE/WEBROOT/APPHOST"  -filter "system.webServer/rewrite/outboundRules/rule[@name='{{ rule1 }}']/action" -name "type" -value "Rewrite"
+          "Server global setting added to URLRewrite" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      args:
+        executable: powershell
+      register: add_global_setting_result
+      failed_when: "'ERROR' in add_global_setting_result.stderr"
+
+    - name: Remove all pre-existing sites and default app pool
+      win_shell: |
+        try {
+          Get-WebSite -ErrorAction Stop | % {Remove-WebSite $_.Name -Confirm:$false -ErrorAction Stop}
+          Get-ChildItem IIS:\\AppPools -ErrorAction Stop | % {Remove-WebAppPool -Name $_.Name -ErrorAction Stop}
+          "Removed all pre-existing sites and default app pool" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      args:
+        executable: powershell
+      register: remove_sites_and_app_pool_result
+      failed_when: "'ERROR' in remove_sites_and_app_pool_result.stderr"
+
+    - name: Truncate and Cycle Validation
+      win_shell: |
+        try {
+          Set-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST'  -filter "system.applicationHost/sites/siteDefaults/logFile" -name "period" -value MaxSize -ErrorAction SilentlyContinue
+          Set-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST'  -filter "system.applicationHost/sites/siteDefaults/logFile" -name "truncateSize" -value 500000000 -ErrorAction SilentlyContinue
+          Set-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST'  -filter "system.applicationHost/log/centralW3CLogFile" -name "logExtFileFlags" -value "Date,Time,ClientIP,UserName,SiteName,ComputerName,ServerIP,Method,UriStem,UriQuery,HttpStatus,Win32Status,BytesSent,BytesRecv,TimeTaken,ServerPort,UserAgent,Cookie,Referer,ProtocolVersion,Host,HttpSubStatus" -ErrorAction SilentlyContinue
+          "Truncate and Cycle Validation completed" | Out-File "{{ log_file_name }}" -Append -Force
+        } catch {
+          "ERROR: $($_.Exception.Message)" | Out-File "{{ log_file_name }}" -Append -Force
+        }
+      args:
+        executable: powershell
+      register: truncate_and_cycle_validation_result
+      failed_when: "'ERROR' in truncate_and_cycle_validation_result.stderr"
+
+      
+
+
+
+
+
+
